@@ -47,7 +47,8 @@ elif "torch" in xp.__name__:
 # %%
 # input parameters
 
-voxel_size_recon = (2.0, 2.0, 2.78)
+# voxel_size_recon = (2.0, 2.0, 2.78)
+voxel_size_recon = (1.2, 1.2, 1.2)
 lesion_contrast = 4.0
 fwhm_data_mm = 4.0
 
@@ -55,7 +56,7 @@ num_subsets = 34
 num_iter = 4
 fwhm_ps_mm = 4.0
 
-true_counts = 1e7
+true_counts = 0
 
 # %%
 # load the lesion from file
@@ -69,7 +70,7 @@ stl_vox = xp.asarray(
     dtype=xp.float32,
 )
 
-downsampling_factor = 4
+downsampling_factor = 2
 x_les = xp.clip(stl_vox - 1, 0, None)
 x_les = mean_pooling_3d(x_les, downsampling_factor)
 
@@ -100,10 +101,30 @@ for i in range(11, n2 - 11):
 
 # add the lesion to the cylinder such that the lesion is centered in the cylinder
 x_true[
-    int(n0 / 2 - x_les.shape[0] / 2) : int(n0 / 2 + x_les.shape[0] / 2),
+    int(n0 / 3 - x_les.shape[0] / 2) : int(n0 / 3 + x_les.shape[0] / 2),
     int(n0 / 2 - x_les.shape[1] / 2) : int(n0 / 2 + x_les.shape[1] / 2),
     int(n2 / 2 - x_les.shape[2] / 2) : int(n2 / 2 + x_les.shape[2] / 2),
 ] += (lesion_contrast - 1) * x_les
+
+# add a sphere with a diameter of 37mm at int(2*n0/2)
+
+ns0 = int(37 / voxel_size[0]) + 1
+ns2 = int(37 / voxel_size[2]) + 1
+
+x_sphere = xp.zeros((ns0, ns0, ns2), device=dev, dtype=xp.float32)
+
+tmpx = voxel_size[0] * (xp.arange(ns0, device=dev) - ns0 / 2 + 0.5)
+tmpz = voxel_size[2] * (xp.arange(ns2, device=dev) - ns2 / 2 + 0.5)
+
+TX, TY, TZ = xp.meshgrid(tmpx, tmpx, tmpz)
+sp_mask = xp.sqrt(TX**2 + TY**2 + TZ**2) < 0.5 * 37
+
+x_true[
+    int(2 * n0 / 3 - sp_mask.shape[0] / 2) : int(2 * n0 / 3 + sp_mask.shape[0] / 2),
+    int(n0 / 2 - sp_mask.shape[1] / 2) : int(n0 / 2 + sp_mask.shape[1] / 2),
+    int(n2 / 2 - sp_mask.shape[2] / 2) : int(n2 / 2 + sp_mask.shape[2] / 2),
+] += (lesion_contrast - 1) * sp_mask
+
 
 # %%
 # Setup of the forward model :math:`\bar{y}(x) = A x + s`
@@ -214,12 +235,15 @@ contamination = xp.full(
 noise_free_data += contamination
 
 # add Poisson noise
-np.random.seed(1)
-y = xp.asarray(
-    np.random.poisson(parallelproj.to_numpy_array(noise_free_data)),
-    device=dev,
-    dtype=xp.float64,
-)
+if true_counts > 0:
+    np.random.seed(1)
+    y = xp.asarray(
+        np.random.poisson(parallelproj.to_numpy_array(noise_free_data)),
+        device=dev,
+        dtype=xp.float64,
+    )
+else:
+    y = noise_free_data
 
 # %%
 # setup the recon projector (different voxel size)
