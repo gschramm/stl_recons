@@ -6,6 +6,7 @@ import array_api_compat.numpy as np
 import array_api_compat.cupy as xp
 
 import math
+import matplotlib.pyplot as plt
 import parallelproj
 import array_api_compat.numpy as np
 from copy import copy
@@ -47,16 +48,18 @@ elif "torch" in xp.__name__:
 # %%
 # input parameters
 
-# voxel_size_recon = (2.0, 2.0, 2.78)
-voxel_size_recon = (1.2, 1.2, 1.2)
+voxel_size_recon = (2.0, 2.0, 2.78)
+# voxel_size_recon = (1.2, 1.2, 1.2)
 lesion_contrast = 4.0
-fwhm_data_mm = 4.0
+fwhm_data_mm = 5.0
+fwhm_recon_mm = 5.0
 
 num_subsets = 34
 num_iter = 4
-fwhm_ps_mm = 4.0
+fwhm_ps_mm = 5.0
 
-true_counts = 0
+true_counts = 1e7
+seed = 1
 
 # %%
 # load the lesion from file
@@ -74,10 +77,10 @@ downsampling_factor = 2
 x_les = xp.clip(stl_vox - 1, 0, None)
 x_les = mean_pooling_3d(x_les, downsampling_factor)
 
-x_les = x_les[:, :, : int(x_les.shape[2] / 1.75)]
+x_les = x_les[:, :, : int(x_les.shape[2] / 1.9)]
 
 voxel_size = 3 * (downsampling_factor * vs,)
-# img_shape = x_les.shape
+print(float(x_les.sum() * np.prod(voxel_size)) / 1000)
 
 # %%
 # setup a cylinder background image
@@ -184,7 +187,7 @@ att_sino = xp.exp(-proj_data(x_att))
 
 # enable TOF - comment if you want to run non-TOF
 proj_data.tof_parameters = parallelproj.TOFParameters(
-    num_tofbins=23, tofbin_width=12.0, sigma_tof=12.0
+    num_tofbins=23, tofbin_width=24.0, sigma_tof=24.0
 )
 
 # setup the attenuation multiplication operator which is different
@@ -236,7 +239,7 @@ noise_free_data += contamination
 
 # add Poisson noise
 if true_counts > 0:
-    np.random.seed(1)
+    np.random.seed(seed)
     y = xp.asarray(
         np.random.poisson(parallelproj.to_numpy_array(noise_free_data)),
         device=dev,
@@ -259,7 +262,7 @@ proj = parallelproj.RegularPolygonPETProjector(
 proj.tof_parameters = proj_data.tof_parameters
 
 res_model = parallelproj.GaussianFilterOperator(
-    proj.in_shape, sigma=fwhm_data_mm / (2.35 * proj.voxel_size)
+    proj.in_shape, sigma=fwhm_recon_mm / (2.35 * proj.voxel_size)
 )
 
 # compose all 3 operators into a single linear operator
@@ -420,12 +423,12 @@ aff = nib.affines.from_matvec(np.diag(voxel_size_recon))
 
 nib.save(
     nib.Nifti1Image(parallelproj.to_numpy_array(x), affine=aff),
-    "output/osem_no_filter.nii.gz",
+    f"output/osem_no_filter_con_{lesion_contrast}_tc_{true_counts:.2E}.nii.gz",
 )
 
 nib.save(
     nib.Nifti1Image(parallelproj.to_numpy_array(x_ps), affine=aff),
-    f"output/osem_{fwhm_ps_mm}mm_filter.nii.gz",
+    f"output/osem_{fwhm_ps_mm}mm_filter_{lesion_contrast}_tc_{true_counts:.2E}.nii.gz",
 )
 
 # show the results
@@ -438,3 +441,36 @@ vi = pv.ThreeAxisViewer(
     imshow_kwargs=kws,
     voxsize=voxel_size_recon,
 )
+
+
+# %%
+n0, n1, n2 = x_ps.shape
+m0 = 1.5 * sp_mask.shape[0] * voxel_size[0] / voxel_size_recon[0]
+m1 = 1.5 * sp_mask.shape[1] * voxel_size[1] / voxel_size_recon[1]
+m2 = 1.5 * sp_mask.shape[2] * voxel_size[2] / voxel_size_recon[2]
+
+sub_vol = (
+    parallelproj.to_numpy_array(
+        x_ps[
+            int(2 * n0 / 3 - m0 / 2) : int(2 * n0 / 3 + m0 / 2),
+            int(n0 / 2 - m1 / 2) : int(n0 / 2 + m1 / 2),
+            int(n2 / 2 - m2 / 2) : int(n2 / 2 + m2 / 2),
+        ]
+    )
+    / scale
+)
+
+from utils import fitspheresubvolume, plotspherefit
+
+fitres = fitspheresubvolume(
+    sub_vol,
+    np.array(voxel_size_recon),
+    Rfix=0.5 * 37,
+    Sfix=lesion_contrast,
+    Bfix=1.0,
+    dfix=0.0,
+)
+
+fig, ax = plt.subplots(1, 1, figsize=(8, 8), layout="constrained")
+plotspherefit(fitres, ax=ax, unit="mm", showres=True)
+fig.show()
