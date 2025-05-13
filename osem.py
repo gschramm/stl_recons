@@ -8,8 +8,10 @@ import array_api_compat.cupy as xp
 import math
 import parallelproj
 import array_api_compat.numpy as np
-import matplotlib.pyplot as plt
 from copy import copy
+
+import pymirc.viewer as pv
+import nibabel as nib
 
 
 def mean_pooling_3d(arr: np.ndarray, f: int = 2) -> np.ndarray:
@@ -43,11 +45,20 @@ elif "torch" in xp.__name__:
 
 
 # %%
-# setup the LOR descriptor that defines the sinogram
+# input parameters
 
-voxel_size_recon = (1.0, 1.0, 1.0)
+voxel_size_recon = (2.0, 2.0, 2.78)
+lesion_contrast = 4.0
 fwhm_data_mm = 4.0
 
+num_subsets = 34
+num_iter = 4
+fwhm_ps_mm = 4.0
+
+true_counts = 1e7
+
+# %%
+# load the lesion from file
 vs = float(
     np.load("data/scale 100% w 10 mm sphere_voxelized_vs_0.1_mm.npz")["voxel_size"]
 )
@@ -58,14 +69,41 @@ stl_vox = xp.asarray(
     dtype=xp.float32,
 )
 
-downsampling_factor = 2
-x_true = xp.clip(stl_vox - 1, 0, None)
-x_true = mean_pooling_3d(x_true, downsampling_factor)
+downsampling_factor = 4
+x_les = xp.clip(stl_vox - 1, 0, None)
+x_les = mean_pooling_3d(x_les, downsampling_factor)
 
-x_true = x_true[:, :, : int(x_true.shape[2] / 1.75)]
+x_les = x_les[:, :, : int(x_les.shape[2] / 1.75)]
 
-img_shape = x_true.shape
 voxel_size = 3 * (downsampling_factor * vs,)
+# img_shape = x_les.shape
+
+# %%
+# setup a cylinder background image
+
+n0 = int(300 / voxel_size[0])
+n2 = int(85 / voxel_size[2])
+
+img_shape = (n0, n0, n2)
+
+x_true = xp.zeros(img_shape, device=dev, dtype=xp.float32)
+
+# for every slice [:, :, i] fill the slice with a cylinder of radius 100 pixels
+tmp = xp.linspace(-1, 1, n0, dtype=xp.float32, device=dev)
+XX, YY = xp.meshgrid(tmp, tmp)
+RHO = xp.sqrt(XX**2 + YY**2)
+mask = RHO < 0.75
+
+for i in range(11, n2 - 11):
+    x_true[:, :, i] = mask
+
+
+# add the lesion to the cylinder such that the lesion is centered in the cylinder
+x_true[
+    int(n0 / 2 - x_les.shape[0] / 2) : int(n0 / 2 + x_les.shape[0] / 2),
+    int(n0 / 2 - x_les.shape[1] / 2) : int(n0 / 2 + x_les.shape[1] / 2),
+    int(n2 / 2 - x_les.shape[2] / 2) : int(n2 / 2 + x_les.shape[2] / 2),
+] += (lesion_contrast - 1) * x_les
 
 # %%
 # Setup of the forward model :math:`\bar{y}(x) = A x + s`
@@ -78,7 +116,7 @@ voxel_size = 3 * (downsampling_factor * vs,)
 #     The OSEM implementation below works with all linear operators that
 #     subclass :class:`.LinearOperator` (e.g. the high-level projectors).
 
-num_rings = 15
+num_rings = 18
 scanner = parallelproj.RegularPolygonPETScannerGeometry(
     xp,
     dev,
@@ -125,7 +163,7 @@ att_sino = xp.exp(-proj_data(x_att))
 
 # enable TOF - comment if you want to run non-TOF
 proj_data.tof_parameters = parallelproj.TOFParameters(
-    num_tofbins=13, tofbin_width=12.0, sigma_tof=12.0
+    num_tofbins=23, tofbin_width=12.0, sigma_tof=12.0
 )
 
 # setup the attenuation multiplication operator which is different
@@ -156,6 +194,15 @@ pet_lin_op_data = parallelproj.CompositeLinearOperator(
 # simulated noise-free data
 noise_free_data = pet_lin_op_data(x_true)
 
+# scale the noise-free data and x_true to the desired number of counts true counts
+if true_counts > 0:
+    scale = true_counts / float(xp.sum(noise_free_data))
+    noise_free_data *= scale
+    x_true *= scale
+else:
+    scale = 1.0
+
+
 # generate a contant contamination sinogram
 contamination = xp.full(
     noise_free_data.shape,
@@ -176,7 +223,11 @@ y = xp.asarray(
 
 # %%
 # setup the recon projector (different voxel size)
-ims = 3 * (math.ceil(img_shape[0] * voxel_size[0] / voxel_size_recon[0]),)
+ims = (
+    math.ceil(img_shape[0] * voxel_size[0] / voxel_size_recon[0]),
+    math.ceil(img_shape[1] * voxel_size[1] / voxel_size_recon[1]),
+    math.ceil(img_shape[2] * voxel_size[2] / voxel_size_recon[2]),
+)
 
 proj = parallelproj.RegularPolygonPETProjector(
     lor_desc, img_shape=ims, voxel_size=voxel_size_recon
@@ -200,8 +251,6 @@ pet_lin_op = parallelproj.CompositeLinearOperator((att_op, proj, res_model))
 # a subset of views. The slices can be used to extract the corresponding subsets
 # from full data or corrections sinograms.
 
-num_subsets = 34
-
 subset_views, subset_slices = proj.lor_descriptor.get_distributed_views_and_slices(
     num_subsets, len(proj.out_shape)
 )
@@ -219,8 +268,6 @@ pet_subset_linop_seq = []
 # (2) subset projector
 # (3) multiplication with the corresponding subset of the attenuation sinogram
 for i in range(num_subsets):
-    print(f"subset {i:02} containing views {subset_views[i]}")
-
     # make a copy of the full projector and reset the views to project
     subset_proj = copy(proj)
     subset_proj.views = subset_views[i]
@@ -317,9 +364,6 @@ def em_update(
 #
 # The "sensitivity" images are also calculated separately for each subset.
 
-# number of OSEM iterations
-num_iter = 4 * 34 // len(pet_subset_linop_seq)
-
 # initialize x
 x = xp.ones(pet_lin_op.in_shape, dtype=xp.float64, device=dev)
 
@@ -338,13 +382,35 @@ for i in range(num_iter):
         )
 
 # %%
-# Calculation of the negative Poisson log-likelihood function of the reconstruction
-# ---------------------------------------------------------------------------------
+# setup a post filter operator
 
-# calculate the negative Poisson log-likelihood function of the reconstruction
-exp = pet_lin_op(x) + contamination
-# calculate the relative cost and distance to the optimal point
-cost = float(xp.sum(exp - y * xp.log(exp)))
-print(
-    f"\nOSEM cost {cost:.6E} after {num_iter:03} iterations with {num_subsets} subsets"
+post_filter = parallelproj.GaussianFilterOperator(
+    x.shape, sigma=fwhm_ps_mm / (2.35 * proj.voxel_size)
+)
+
+x_ps = post_filter(x)
+
+# %%
+# save x and x_ps to nifti
+aff = nib.affines.from_matvec(np.diag(voxel_size_recon))
+
+nib.save(
+    nib.Nifti1Image(parallelproj.to_numpy_array(x), affine=aff),
+    "output/osem_no_filter.nii.gz",
+)
+
+nib.save(
+    nib.Nifti1Image(parallelproj.to_numpy_array(x_ps), affine=aff),
+    f"output/osem_{fwhm_ps_mm}mm_filter.nii.gz",
+)
+
+# show the results
+
+kws = dict(
+    vmax=1.5 * float(xp.max(x_true)),
+)
+vi = pv.ThreeAxisViewer(
+    [parallelproj.to_numpy_array(z) for z in [x, x_ps]],
+    imshow_kwargs=kws,
+    voxsize=voxel_size_recon,
 )
