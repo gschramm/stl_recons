@@ -12,7 +12,11 @@ import array_api_compat.numpy as np
 from copy import copy
 
 import pymirc.viewer as pv
+import pymirc.fileio as pf
 import nibabel as nib
+
+from utils import fitspheresubvolume, plotspherefit
+import argparse
 
 
 def mean_pooling_3d(arr: np.ndarray, f: int = 2) -> np.ndarray:
@@ -48,9 +52,24 @@ elif "torch" in xp.__name__:
 # %%
 # input parameters
 
-voxel_size_recon = (2.0, 2.0, 2.78)
+parser = argparse.ArgumentParser(description="OSEM reconstruction parameters")
+parser.add_argument(
+    "--true_counts", type=float, default=1e7, help="Total true counts (default: 1e7)"
+)
+parser.add_argument("--seed", type=int, default=1, help="Random seed (default: 1)")
+parser.add_argument(
+    "--lesion_contrast", type=float, default=4.0, help="Lesion contrast (default: 4.0)"
+)
+args = parser.parse_args()
+
+true_counts = args.true_counts
+seed = args.seed
+lesion_contrast = args.lesion_contrast
+
+# %%
+
+voxel_size_recon = (2.34, 2.34, 2.78)
 # voxel_size_recon = (1.2, 1.2, 1.2)
-lesion_contrast = 4.0
 fwhm_data_mm = 5.0
 fwhm_recon_mm = 5.0
 
@@ -58,8 +77,6 @@ num_subsets = 34
 num_iter = 4
 fwhm_ps_mm = 5.0
 
-true_counts = 1e7
-seed = 1
 
 # %%
 # load the lesion from file
@@ -70,7 +87,6 @@ vs = float(
 stl_vox = xp.asarray(
     np.load("data/scale 100% w 10 mm sphere_voxelized_vs_0.1_mm.npz")["image"],
     device=dev,
-    dtype=xp.float32,
 )
 
 downsampling_factor = 2
@@ -80,13 +96,14 @@ x_les = mean_pooling_3d(x_les, downsampling_factor)
 x_les = x_les[:, :, : int(x_les.shape[2] / 1.9)]
 
 voxel_size = 3 * (downsampling_factor * vs,)
-print(float(x_les.sum() * np.prod(voxel_size)) / 1000)
+les_vol_ml = float(x_les.sum() * np.prod(voxel_size)) / 1000
+print(f"lesion volume in ml: {les_vol_ml:.2f}")
 
 # %%
 # setup a cylinder background image
 
 n0 = int(300 / voxel_size[0])
-n2 = int(85 / voxel_size[2])
+n2 = int(100 / voxel_size[2])
 
 img_shape = (n0, n0, n2)
 
@@ -140,7 +157,7 @@ x_true[
 #     The OSEM implementation below works with all linear operators that
 #     subclass :class:`.LinearOperator` (e.g. the high-level projectors).
 
-num_rings = 18
+num_rings = 22
 scanner = parallelproj.RegularPolygonPETScannerGeometry(
     xp,
     dev,
@@ -421,16 +438,36 @@ x_ps = post_filter(x)
 # save x and x_ps to nifti
 aff = nib.affines.from_matvec(np.diag(voxel_size_recon))
 
+base = f"osem_no_filter_con_{lesion_contrast}_tc_{true_counts:.2E}_s_{seed}"
+
 nib.save(
     nib.Nifti1Image(parallelproj.to_numpy_array(x), affine=aff),
-    f"output/osem_no_filter_con_{lesion_contrast}_tc_{true_counts:.2E}.nii.gz",
+    f"output/{base}.nii.gz",
 )
+
+pf.write_3d_static_dicom(
+    parallelproj.to_numpy_array(x),
+    f"output/{base}",
+    affine=aff,
+    PatientName="STL_Phantom",
+    SeriesDescription=base,
+    PatientWeight=les_vol_ml,
+)
+
+base_ps = f"osem_{fwhm_ps_mm}mm_filter_{lesion_contrast}_tc_{true_counts:.2E}_s_{seed}"
 
 nib.save(
     nib.Nifti1Image(parallelproj.to_numpy_array(x_ps), affine=aff),
-    f"output/osem_{fwhm_ps_mm}mm_filter_{lesion_contrast}_tc_{true_counts:.2E}.nii.gz",
+    f"output/{base_ps}.nii.gz",
 )
-
+pf.write_3d_static_dicom(
+    parallelproj.to_numpy_array(x_ps),
+    f"output/{base_ps}",
+    affine=aff,
+    PatientName="STL_Phantom",
+    SeriesDescription=base_ps,
+    PatientWeight=les_vol_ml,
+)
 # show the results
 
 kws = dict(
@@ -460,8 +497,6 @@ sub_vol = (
     / scale
 )
 
-from utils import fitspheresubvolume, plotspherefit
-
 fitres = fitspheresubvolume(
     sub_vol,
     np.array(voxel_size_recon),
@@ -473,4 +508,5 @@ fitres = fitspheresubvolume(
 
 fig, ax = plt.subplots(1, 1, figsize=(8, 8), layout="constrained")
 plotspherefit(fitres, ax=ax, unit="mm", showres=True)
+fig.savefig(f"output/{base_ps}_sphere_fit.png", dpi=300)
 fig.show()
